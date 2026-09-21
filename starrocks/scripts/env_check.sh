@@ -831,15 +831,15 @@ function change_limit() {
     fi
 
     if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+soft[[:space:]]+stack" /etc/security/limits.conf') ]]; then
-        sshUpdate "$host" 'echo "* soft stack unlimited" >> /etc/security/limits.conf'
+        sshUpdate "$host" 'echo "* soft stack 8192" >> /etc/security/limits.conf'
     else
-        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+soft[[:space:]]\+stack\b.*/\* soft stack unlimited/" /etc/security/limits.conf'
+        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+soft[[:space:]]\+stack\b.*/\* soft stack 8192/" /etc/security/limits.conf'
     fi
 
     if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+hard[[:space:]]+stack" /etc/security/limits.conf') ]]; then
-        sshUpdate "$host" 'echo "* hard stack unlimited" >> /etc/security/limits.conf'
+        sshUpdate "$host" 'echo "* hard stack 8192" >> /etc/security/limits.conf'
     else
-        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+hard[[:space:]]\+stack\b.*/\* hard stack unlimited/" /etc/security/limits.conf'
+        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+hard[[:space:]]\+stack\b.*/\* hard stack 8192/" /etc/security/limits.conf'
     fi
 
     if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+soft[[:space:]]+memlock" /etc/security/limits.conf') ]]; then
