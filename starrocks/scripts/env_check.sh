@@ -491,8 +491,10 @@ done
 
 # 从字符串中提取IP地址，支持格式如192.168.100.111或192.168.100.111_9010_12331212979421794
 function extract_ip() {
-    # 使用正则表达式匹配IP地址部分
-    echo "$1" | sed -E 's/^([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}).*/\1/'
+    # 去掉末尾的 "_<端口>_<id>" 后缀，保留前面的 IP 或主机名部分
+    # 兼容 IP 模式 (192.168.100.111_9010_12331212979421794) 和 FQDN 模式 (dwh-dbr11-le2.hq.bc_9010_1732862579080)
+    # 没有该后缀的普通 IP/主机名原样返回
+    echo "$1" | sed -E 's/_[0-9]+_[0-9]+$//'
 }
 
 # 输出表格
@@ -1352,25 +1354,8 @@ function check_disk_space() {
         echo "No physical disk found"
         return
     fi
-    
-    # 提取数字部分并转换为GB
-    local space_num=$(echo $space_info | sed 's/[^0-9.]//g')
-    local space_unit=$(echo $space_info | sed 's/[0-9.]//g')
-    
-    # 转换为GB进行比较
-    if [ "$space_unit" = "T" ]; then
-        space_num=$(echo "$space_num * 1024" | bc)
-    elif [ "$space_unit" = "M" ]; then
-        space_num=$(echo "scale=2; $space_num / 1024" | bc)
-    elif [ "$space_unit" = "K" ]; then
-        space_num=$(echo "scale=2; $space_num / 1024 / 1024" | bc)
-    fi
-    
-    if (( $(echo "$space_num >= 10" | bc -l) )); then
-        echo "$mount_point: $space_info"
-    else
-        echo "$mount_point: $space_info"
-    fi
+
+    echo "$mount_point: $space_info"
 }
 
 # 检查FE节点磁盘空间
