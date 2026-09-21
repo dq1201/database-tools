@@ -23,6 +23,278 @@ new_user_password=""
 # Manager节点IP
 manager_node=""
 
+# ---------------------------------------------------------------------------
+# 系统参数阈值配置（如需调整检查/修改的目标值，只改这里）
+# ---------------------------------------------------------------------------
+LIMIT_NOFILE=655350                # 单进程最大打开文件数 (ulimit -n / limits.conf nofile)
+LIMIT_NPROC=65535                  # 单用户最大进程数 (ulimit -u / limits.conf nproc)
+LIMIT_STACK=8192                   # 线程栈大小，单位KB (limits.conf stack)
+LIMIT_MEMLOCK=unlimited            # 锁定内存大小 (limits.conf memlock)
+SYSCTL_SWAPPINESS=0                # vm.swappiness
+SYSCTL_OVERCOMMIT_MEMORY=1         # vm.overcommit_memory
+SYSCTL_SOMAXCONN=1024              # net.core.somaxconn
+SYSCTL_TCP_ABORT_ON_OVERFLOW=1     # net.ipv4.tcp_abort_on_overflow
+SYSCTL_THREADS_MAX=120000          # kernel.threads-max
+SYSCTL_PID_MAX=200000              # kernel.pid_max
+
+# green:通过 red:未通过 blue:需修改配置 yellow: 标题
+function echo_color() {
+    case "$1" in
+        green)  echo -e "\033[32;40m$2\033[0m" ;;
+        red)    echo -e "\033[31;40m$2\033[0m" ;;
+        yellow) echo -e "\033[33;40m$2\033[0m" ;;
+        blue)   echo -e "\033[34;40m$2\033[0m" ;;
+        *)      echo "$2" ;;
+    esac
+}
+
+# ==============================================================================
+# 初始化部署环境功能所需函数
+# 注意：这些函数必须在下方 --init-deploy 分支调用 init_deploy_env 之前定义，
+#       否则 bash 按行顺序执行到调用处时函数尚未定义，会直接报错退出
+# ==============================================================================
+
+# 使用sshpass进行密码登录
+function sshpass_ssh() {
+    local host="$1"
+    local user="$2"
+    local pass="$3"
+    local cmd="$4"
+    sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$user@$host" "$cmd" 2>/dev/null
+}
+
+function sshpass_scp() {
+    local pass="$1"
+    local src="$2"
+    local dest="$3"
+    sshpass -p "$pass" scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$src" "$dest" 2>/dev/null
+}
+
+# 在单个节点创建用户
+function create_user_on_node() {
+    local host="$1"
+    local user="$2"
+    local pass="$3"
+    local login_user="$4"
+    local login_pass="$5"
+
+    echo "  [${host}] 创建用户 ${user}..."
+
+    # 检查用户是否已存在
+    local user_exists=$(sshpass_ssh "$host" "$login_user" "$login_pass" "id $user 2>/dev/null" 2>&1)
+
+    if [[ "$user_exists" =~ "uid=" ]]; then
+        echo "    用户 $user 已存在，跳过创建"
+    else
+        # 创建用户
+        sshpass_ssh "$host" "$login_user" "$login_pass" "useradd -m -s /bin/bash $user" 2>&1
+        if [[ $? -ne 0 ]]; then
+            echo "    [错误] 创建用户失败"
+            return 1
+        fi
+        echo "    用户创建成功"
+    fi
+
+    # 设置密码
+    echo "$user:$pass" | sshpass_ssh "$host" "$login_user" "$login_pass" "chpasswd" 2>&1
+    if [[ $? -eq 0 ]]; then
+        echo "    密码设置成功"
+    else
+        echo "    [警告] 密码设置可能失败"
+    fi
+
+    # 配置sudo权限 (NOPASSWD)
+    sshpass_ssh "$host" "$login_user" "$login_pass" "echo '$user ALL=(ALL) NOPASSWD: ALL' > /tmp/${user}_sudoers" 2>&1
+    sshpass_ssh "$host" "$login_user" "$login_pass" "mv /tmp/${user}_sudoers /etc/sudoers.d/${user}" 2>&1
+    sshpass_ssh "$host" "$login_user" "$login_pass" "chmod 440 /etc/sudoers.d/${user}" 2>&1
+
+    echo "    Sudo权限配置完成"
+    return 0
+}
+
+# 在manager节点生成SSH密钥
+function setup_ssh_key() {
+    local manager="$1"
+    local user="$2"
+    local pass="$3"
+    local login_user="$4"
+    local login_pass="$5"
+
+    echo "  [${manager}] 生成SSH密钥..."
+
+    # 检查密钥是否已存在
+    local key_exists=$(sshpass_ssh "$manager" "$login_user" "$login_pass" "test -f /home/$user/.ssh/id_rsa && echo 'exists'" 2>&1)
+
+    if [[ "$key_exists" == "exists" ]]; then
+        echo "    SSH密钥已存在，跳过生成"
+    else
+        # 以目标用户身份生成密钥
+        # 先切换到目标用户
+        sshpass_ssh "$manager" "$login_user" "$login_pass" "su - $user -c 'ssh-keygen -t rsa -N \"\" -f /home/$user/.ssh/id_rsa'" 2>&1
+        if [[ $? -ne 0 ]]; then
+            echo "    [错误] SSH密钥生成失败"
+            return 1
+        fi
+        echo "    SSH密钥生成成功"
+    fi
+
+    # 设置authorized_keys权限
+    sshpass_ssh "$manager" "$login_user" "$login_pass" "mkdir -p /home/$user/.ssh && chmod 700 /home/$user/.ssh" 2>&1
+    sshpass_ssh "$manager" "$login_user" "$login_pass" "touch /home/$user/.ssh/authorized_keys && chmod 600 /home/$user/.ssh/authorized_keys" 2>&1
+    sshpass_ssh "$manager" "$login_user" "$login_pass" "chown -R $user:$user /home/$user/.ssh" 2>&1
+
+    # 获取公钥
+    local pub_key=$(sshpass_ssh "$manager" "$login_user" "$login_pass" "cat /home/$user/.ssh/id_rsa.pub" 2>&1)
+
+    echo "$pub_key"
+}
+
+# 分发SSH公钥到其他节点
+function distribute_ssh_key() {
+    local host="$1"
+    local pub_key="$2"
+    local user="$3"
+    local pass="$4"
+    local login_user="$5"
+    local login_pass="$6"
+
+    echo "  [${host}] 分发SSH公钥..."
+
+    # 确保.ssh目录存在
+    sshpass_ssh "$host" "$login_user" "$login_pass" "mkdir -p /home/$user/.ssh && chmod 700 /home/$user/.ssh" 2>&1
+
+    # 检查公钥是否已存在
+    local key_exists=$(sshpass_ssh "$host" "$login_user" "$login_pass" "grep -F '$pub_key' /home/$user/.ssh/authorized_keys" 2>&1)
+
+    if [[ -n "$key_exists" ]]; then
+        echo "    公钥已存在，跳过"
+    else
+        # 追加公钥到authorized_keys
+        sshpass_ssh "$host" "$login_user" "$login_pass" "echo '$pub_key' >> /home/$user/.ssh/authorized_keys" 2>&1
+        if [[ $? -eq 0 ]]; then
+            echo "    公钥分发成功"
+        else
+            echo "    [错误] 公钥分发失败"
+            return 1
+        fi
+    fi
+
+    # 设置正确权限
+    sshpass_ssh "$host" "$login_user" "$login_pass" "chmod 600 /home/$user/.ssh/authorized_keys && chown -R $user:$user /home/$user/.ssh" 2>&1
+
+    return 0
+}
+
+# 测试SSH免密登录
+function test_ssh_connection() {
+    local from_host="$1"
+    local to_host="$2"
+    local user="$3"
+    local pass="$4"
+    local login_user="$5"
+    local login_pass="$6"
+
+    echo "  测试 ${from_host} -> ${to_host} SSH免密..."
+
+    # 从源节点SSH到目标节点
+    local result=$(sshpass_ssh "$from_host" "$login_user" "$login_pass" "su - $user -c 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 $user@$to_host \"echo ok\"'" 2>&1)
+
+    if [[ "$result" == "ok" ]]; then
+        echo "    免密登录成功"
+        return 0
+    else
+        echo "    [错误] 免密登录失败: $result"
+        return 1
+    fi
+}
+
+# 主函数：初始化部署环境
+function init_deploy_env() {
+    echo ""
+    echo "=============================================================================================="
+    echo "                           开始初始化部署环境                                                "
+    echo "=============================================================================================="
+    echo ""
+    echo "配置信息："
+    echo "  节点列表: $deploy_nodes"
+    echo "  新用户: $new_user"
+    echo "  Manager节点: $manager_node"
+    echo "  登录用户: $sr_user"
+    echo ""
+
+    # 解析节点列表
+    local nodes=$(echo "$deploy_nodes" | tr ',;' ' ')
+    local node_array=()
+    for node in $nodes; do
+        node_array+=("$node")
+    done
+
+    # 检查节点数量
+    if [[ ${#node_array[@]} -lt 1 ]]; then
+        echo_color red "错误: 节点列表为空"
+        return 1
+    fi
+
+    echo_color yellow "步骤1: 在所有节点创建用户..."
+    for node in "${node_array[@]}"; do
+        create_user_on_node "$node" "$new_user" "$new_user_password" "$sr_user" "$sr_password"
+        if [[ $? -ne 0 ]]; then
+            echo_color red "在节点 $node 创建用户失败"
+            return 1
+        fi
+    done
+    echo_color green "  所有节点用户创建完成"
+    echo ""
+
+    echo_color yellow "步骤2: 在Manager节点生成SSH密钥..."
+    local pub_key=$(setup_ssh_key "$manager_node" "$new_user" "$new_user_password" "$sr_user" "$sr_password")
+    if [[ -z "$pub_key" ]]; then
+        echo_color red "  SSH密钥生成失败"
+        return 1
+    fi
+    echo_color green "  SSH密钥生成完成"
+    echo ""
+
+    echo_color yellow "步骤3: 分发SSH公钥到所有节点..."
+    for node in "${node_array[@]}"; do
+        distribute_ssh_key "$node" "$pub_key" "$new_user" "$new_user_password" "$sr_user" "$sr_password"
+        if [[ $? -ne 0 ]]; then
+            echo_color red "  公钥分发到 $node 失败"
+            return 1
+        fi
+    done
+    echo_color green "  所有节点公钥分发完成"
+    echo ""
+
+    echo_color yellow "步骤4: 测试SSH免密连接..."
+    local test_failed=0
+    for node in "${node_array[@]}"; do
+        if [[ "$node" != "$manager_node" ]]; then
+            test_ssh_connection "$manager_node" "$node" "$new_user" "$new_user_password" "$sr_user" "$sr_password"
+            if [[ $? -ne 0 ]]; then
+                test_failed=1
+            fi
+        fi
+    done
+
+    echo ""
+    echo "=============================================================================================="
+    if [[ $test_failed -eq 0 ]]; then
+        echo_color green "                           初始化部署环境完成!                                                  "
+    else
+        echo_color red "                           初始化完成，但部分免密测试失败                                            "
+    fi
+    echo "=============================================================================================="
+    echo ""
+    echo "后续步骤："
+    echo "  1. 使用 starrocks 用户登录各节点验证: ssh ${new_user}@<IP>"
+    echo "  2. 从 manager 节点免密登录其他节点: ssh ${new_user}@<其他节点IP>"
+    echo "  3. 继续部署 StarRocks 集群"
+    echo ""
+
+    return 0
+}
+
 if [[ $1 = "--help" ]]; then
     #输出使用信息
     echo "----------------------------------------------------------------------------------------------"
@@ -217,17 +489,6 @@ while getopts ":h:P:u:p:o:l:" opt; do
     esac
 done
 
-# green:通过 red:未通过 blue:需修改配置 yellow: 标题
-function echo_color() {
-    case "$1" in
-        green)  echo -e "\033[32;40m$2\033[0m" ;;
-        red)    echo -e "\033[31;40m$2\033[0m" ;;
-        yellow) echo -e "\033[33;40m$2\033[0m" ;;
-        blue)   echo -e "\033[34;40m$2\033[0m" ;;
-        *)      echo "$2" ;;
-    esac
-}
-
 # 从字符串中提取IP地址，支持格式如192.168.100.111或192.168.100.111_9010_12331212979421794
 function extract_ip() {
     # 使用正则表达式匹配IP地址部分
@@ -306,9 +567,59 @@ function sshcheck() {
     ssh ${SSH_OPTS} "${exe_user}@${1}" "${2}" 2>/dev/null
 }
 
-# 到其他节点执行更新
+# 到其他节点执行更新，失败时打印告警信息（含远程命令的报错内容），方便定位是哪个节点/哪条命令没有权限或执行失败
 function sshUpdate() {
-    ssh ${SSH_OPTS} "${exe_user}@${1}" "${2}" >/dev/null 2>&1
+    local host="$1"
+    local cmd="$2"
+    local err
+    err=$(ssh ${SSH_OPTS} "${exe_user}@${host}" "${cmd}" 2>&1 >/dev/null)
+    local status=$?
+    if [[ $status -ne 0 ]]; then
+        echo_color red "  [警告] 在 ${host} 上执行命令失败(exit ${status}): ${cmd}" >&2
+        [[ -n "$err" ]] && echo_color red "  ${err}" >&2
+    fi
+    return $status
+}
+
+# 确保远程配置文件中存在某一行配置：若已存在匹配 match_pattern 的行，则用 new_line 整行替换；否则追加 new_line。
+# 用于替代逐个参数手写的 "grep存在则sed替换/不存在则echo追加" 重复逻辑。
+# 用法: ensure_conf_line <host> <file> <match_pattern> <new_line>
+#   match_pattern: 用于 grep -P / sed 匹配已有行的正则（不需要包含行尾 .*）
+#   new_line     : 匹配到时用来整行替换、未匹配到时追加的完整内容
+function ensure_conf_line() {
+    local host="$1"
+    local file="$2"
+    local match_pattern="$3"
+    local new_line="$4"
+    # 转义 new_line 中对 sed 替换部分有特殊含义的字符 (/ 和 &)
+    local escaped_new_line
+    escaped_new_line=$(printf '%s' "$new_line" | sed -e 's/[\/&]/\\&/g')
+
+    if [[ -z $(sshcheck "$host" "grep -P '${match_pattern}' '${file}'") ]]; then
+        sshUpdate "$host" "echo '${new_line}' >> '${file}'"
+    else
+        # -r 使用扩展正则，与 match_pattern 里不加反斜杠的 + / [[:space:]] 写法保持一致（对应 grep -P 的写法）
+        sshUpdate "$host" "sed -ri 's/${match_pattern}.*/${escaped_new_line}/' '${file}'"
+    fi
+}
+
+# 根据内存大小(GB)计算推荐的 vm.max_map_count 值。
+# 供 check_max_map_count（检查）和 change_mmc（修改）共用，避免同一套阈值维护两份。
+function required_max_map_count() {
+    local total_mem_gb="$1"
+    if [[ $total_mem_gb -ge 1000 ]]; then
+        echo 8388608
+    elif [[ $total_mem_gb -ge 500 ]]; then
+        echo 4194304
+    elif [[ $total_mem_gb -ge 240 ]]; then
+        echo 2097152
+    elif [[ $total_mem_gb -ge 120 ]]; then
+        echo 1048576
+    elif [[ $total_mem_gb -ge 60 ]]; then
+        echo 524288
+    else
+        echo 262144  # 默认按32GB内存考虑
+    fi
 }
 
 # 批量获取节点系统信息（减少SSH连接次数）
@@ -343,9 +654,9 @@ function check_swap() {
     local swappiness=$(echo "$info" | grep "^SWAPPINESS=" | cut -d= -f2)
     local sysctl_conf=$(echo "$info" | grep "^SYSCTL_CONF=" | cut -d= -f2-)
 
-    if [[ "$swappiness" == "0" ]] && echo "$sysctl_conf" | grep -qE "vm.swappiness[[:space:]]*=[[:space:]]*0"; then
+    if [[ "$swappiness" == "$SYSCTL_SWAPPINESS" ]] && echo "$sysctl_conf" | grep -qE "vm.swappiness[[:space:]]*=[[:space:]]*${SYSCTL_SWAPPINESS}"; then
         echo_color green "swp check pass"
-    elif [[ "$swappiness" == "0" ]]; then
+    elif [[ "$swappiness" == "$SYSCTL_SWAPPINESS" ]]; then
         echo_color red "/etc/sysctl.conf"
     else
         echo_color red "$swappiness"
@@ -358,7 +669,7 @@ function check_ulimitn() {
     local info=$(get_node_sysinfo "$host")
     local ulimitnNum=$(echo "$info" | grep "^ULIMIT_N=" | cut -d= -f2)
 
-    if [[ "655350" -le "$ulimitnNum" ]]; then
+    if [[ "$LIMIT_NOFILE" -le "$ulimitnNum" ]]; then
         echo_color green "ulimit -n: $ulimitnNum"
     else
         echo_color red "ulimit -n: $ulimitnNum"
@@ -386,9 +697,9 @@ function check_overcommit() {
     local overcommit=$(echo "$info" | grep "^OVERCOMMIT=" | cut -d= -f2)
     local sysctl_conf=$(echo "$info" | grep "^SYSCTL_CONF=" | cut -d= -f2-)
 
-    if [[ "$overcommit" == "1" ]] && echo "$sysctl_conf" | grep -qE "vm.overcommit_memory[[:space:]]*=[[:space:]]*1"; then
+    if [[ "$overcommit" == "$SYSCTL_OVERCOMMIT_MEMORY" ]] && echo "$sysctl_conf" | grep -qE "vm.overcommit_memory[[:space:]]*=[[:space:]]*${SYSCTL_OVERCOMMIT_MEMORY}"; then
         echo_color green "ome check pass"
-    elif [[ "$overcommit" == "1" ]]; then
+    elif [[ "$overcommit" == "$SYSCTL_OVERCOMMIT_MEMORY" ]]; then
         echo_color red "/etc/sysctl.conf"
     else
         echo_color red "$overcommit"
@@ -415,7 +726,7 @@ function check_ulimitu() {
     local info=$(get_node_sysinfo "$host")
     local ulimituNum=$(echo "$info" | grep "^ULIMIT_U=" | cut -d= -f2)
 
-    if [[ "65535" -le "$ulimituNum" ]]; then
+    if [[ "$LIMIT_NPROC" -le "$ulimituNum" ]]; then
         echo_color green "ulimit -u: $ulimituNum"
     else
         echo_color red "ulimit -u: $ulimituNum"
@@ -444,9 +755,9 @@ function check_somaxconn() {
     local somaxconn=$(echo "$info" | grep "^SOMAXCONN=" | cut -d= -f2)
     local sysctl_conf=$(echo "$info" | grep "^SYSCTL_CONF=" | cut -d= -f2-)
 
-    if [[ 1024 -le "$somaxconn" ]] && echo "$sysctl_conf" | grep -qE "net.core.somaxconn[[:space:]]*=[[:space:]]*[0-9]{4,}"; then
+    if [[ $SYSCTL_SOMAXCONN -le "$somaxconn" ]] && echo "$sysctl_conf" | grep -qE "net.core.somaxconn[[:space:]]*=[[:space:]]*[0-9]{4,}"; then
         echo_color green "som check pass"
-    elif [[ 1024 -le "$somaxconn" ]]; then
+    elif [[ $SYSCTL_SOMAXCONN -le "$somaxconn" ]]; then
         echo_color red "/etc/sysctl.conf"
     else
         echo_color red "$somaxconn"
@@ -461,7 +772,7 @@ function check_tcp_overflow() {
     local info=$(get_node_sysinfo "$host")
     local tcp_abort=$(echo "$info" | grep "^TCP_ABORT=" | cut -d= -f2)
 
-    if [[ "$tcp_abort" == "1" ]]; then
+    if [[ "$tcp_abort" == "$SYSCTL_TCP_ABORT_ON_OVERFLOW" ]]; then
         echo_color green "tcp check pass"
     else
         echo_color red "$tcp_abort"
@@ -504,7 +815,7 @@ check_FE_pid_ulimitu() {
     soft_limit=$(echo $result | awk '{print $2}' | sed 's/Limit://')
     if [ "$soft_limit" = "unlimited" ]; then
         echo_color green "$result"
-    elif [ "$soft_limit" -lt 65535 ]; then
+    elif [ "$soft_limit" -lt $LIMIT_NPROC ]; then
         echo_color red "$result"
     else
         echo_color green "$result"
@@ -524,7 +835,7 @@ check_FE_pid_ulimitn() {
     soft_limit=$(echo $result | awk '{print $2}' | sed 's/Limit://')
     if [ "$soft_limit" = "unlimited" ]; then
         echo_color green "$result"
-    elif [ "$soft_limit" -lt 655350 ]; then
+    elif [ "$soft_limit" -lt $LIMIT_NOFILE ]; then
         echo_color red "$result"
     else
         echo_color green "$result"
@@ -558,7 +869,7 @@ check_BE_pid_ulimitu() {
     soft_limit=$(echo $result | awk '{print $2}' | sed 's/Limit://')
     if [ "$soft_limit" = "unlimited" ]; then
         echo_color green "$result"
-    elif [ "$soft_limit" -lt 65535 ]; then
+    elif [ "$soft_limit" -lt $LIMIT_NPROC ]; then
         echo_color red "$result"
     else
         echo_color green "$result"
@@ -592,7 +903,7 @@ check_BE_pid_ulimitn() {
     soft_limit=$(echo $result | awk '{print $2}' | sed 's/Limit://')
     if [ "$soft_limit" = "unlimited" ]; then
         echo_color green "$result"
-    elif [ "$soft_limit" -lt 655350 ]; then
+    elif [ "$soft_limit" -lt $LIMIT_NOFILE ]; then
         echo_color red "$result"
     else
         echo_color green "$result"
@@ -649,26 +960,15 @@ function check_max_map_count() {
     total_mem_gb=${total_mem_gb:-0}
     [[ "$total_mem_gb" =~ ^[0-9]+$ ]] || total_mem_gb=0
 
-    # Determine required max_map_count based on memory size
-    local required_max_map_count=262144  # Default for 32GB
-    if [[ $total_mem_gb -ge 1000 ]]; then
-        required_max_map_count=8388608
-    elif [[ $total_mem_gb -ge 500 ]]; then
-        required_max_map_count=4194304
-    elif [[ $total_mem_gb -ge 240 ]]; then
-        required_max_map_count=2097152
-    elif [[ $total_mem_gb -ge 120 ]]; then
-        required_max_map_count=1048576
-    elif [[ $total_mem_gb -ge 60 ]]; then
-        required_max_map_count=524288
-    fi
+    local required_count
+    required_count=$(required_max_map_count "$total_mem_gb")
 
-    if [[ $current_max_map_count -ge $required_max_map_count ]] && echo "$sysctl_conf" | grep -qE "vm.max_map_count[[:space:]]*=[[:space:]]*[0-9]+"; then
-        echo_color green "max_map_count check pass (${current_max_map_count} >= ${required_max_map_count})"
-    elif [[ $current_max_map_count -ge $required_max_map_count ]]; then
+    if [[ $current_max_map_count -ge $required_count ]] && echo "$sysctl_conf" | grep -qE "vm.max_map_count[[:space:]]*=[[:space:]]*[0-9]+"; then
+        echo_color green "max_map_count check pass (${current_max_map_count} >= ${required_count})"
+    elif [[ $current_max_map_count -ge $required_count ]]; then
         echo_color red "check max_map_count in /etc/sysctl.conf"
     else
-        echo_color red "current: ${current_max_map_count}, required: ${required_max_map_count}"
+        echo_color red "current: ${current_max_map_count}, required: ${required_count}"
     fi
 }
 
@@ -698,11 +998,7 @@ function checkVariables() {
 change_selinux() {
     local host="$1"
     sshUpdate "$host" 'setenforce 0'
-    if [[ -z $(sshcheck "$host" 'grep "^SELINUX=" /etc/selinux/config') ]]; then
-        sshUpdate "$host" 'echo "SELINUX=disabled" >> /etc/selinux/config'
-    else
-        sshUpdate "$host" 'sed -i "s/^SELINUX *=.*/SELINUX=disabled/" /etc/selinux/config'
-    fi
+    ensure_conf_line "$host" /etc/selinux/config '^SELINUX[[:space:]]*=' "SELINUX=disabled"
     if [[ -n $(sshcheck "$host" 'grep "^SELINUXTYPE" /etc/selinux/config') ]]; then
         sshUpdate "$host" 'sed -i "s/^SELINUXTYPE *=.*/#SELINUXTYPE/" /etc/selinux/config'
     fi
@@ -724,48 +1020,32 @@ function change_huge() {
 #swappiness 0
 function change_swap() {
     local host="$1"
-    sshUpdate "$host" 'echo 0 > /proc/sys/vm/swappiness'
-    if [[ -z $(sshcheck "$host" 'grep "vm.swappiness" /etc/sysctl.conf') ]]; then
-        sshUpdate "$host" 'echo "vm.swappiness=0" >> /etc/sysctl.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^vm.swappiness *=.*/vm.swappiness=0/" /etc/sysctl.conf'
-    fi
+    sshUpdate "$host" "echo ${SYSCTL_SWAPPINESS} > /proc/sys/vm/swappiness"
+    ensure_conf_line "$host" /etc/sysctl.conf '^vm.swappiness[[:space:]]*=' "vm.swappiness=${SYSCTL_SWAPPINESS}"
 }
 
 # overcommit_memory 1
 function change_overcommit() {
     local host="$1"
-    sshUpdate "$host" 'echo 1 > /proc/sys/vm/overcommit_memory'
-    if [[ -z $(sshcheck "$host" 'grep "vm.overcommit_memory" /etc/sysctl.conf') ]]; then
-        sshUpdate "$host" 'echo "vm.overcommit_memory=1" >> /etc/sysctl.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^vm.overcommit_memory *=.*/vm.overcommit_memory=1/" /etc/sysctl.conf'
-    fi
+    sshUpdate "$host" "echo ${SYSCTL_OVERCOMMIT_MEMORY} > /proc/sys/vm/overcommit_memory"
+    ensure_conf_line "$host" /etc/sysctl.conf '^vm.overcommit_memory[[:space:]]*=' "vm.overcommit_memory=${SYSCTL_OVERCOMMIT_MEMORY}"
 }
 
 # somaxconn 1024
 function change_somaxconn() {
     local host="$1"
-    sshUpdate "$host" 'echo 1024 > /proc/sys/net/core/somaxconn'
-    if [[ -z $(sshcheck "$host" 'grep "net.core.somaxconn" /etc/sysctl.conf') ]]; then
-        sshUpdate "$host" 'echo "net.core.somaxconn=1024" >> /etc/sysctl.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^net.core.somaxconn *=.*/net.core.somaxconn=1024/" /etc/sysctl.conf'
-    fi
+    sshUpdate "$host" "echo ${SYSCTL_SOMAXCONN} > /proc/sys/net/core/somaxconn"
+    ensure_conf_line "$host" /etc/sysctl.conf '^net.core.somaxconn[[:space:]]*=' "net.core.somaxconn=${SYSCTL_SOMAXCONN}"
 }
 
 #tcp_abort_on_overflow 1
 function change_tcp() {
     local host="$1"
-    sshUpdate "$host" 'echo 1 > /proc/sys/net/ipv4/tcp_abort_on_overflow'
-    if [[ -z $(sshcheck "$host" 'grep "net.ipv4.tcp_abort_on_overflow" /etc/sysctl.conf') ]]; then
-        sshUpdate "$host" 'echo "net.ipv4.tcp_abort_on_overflow=1" >> /etc/sysctl.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^net.ipv4.tcp_abort_on_overflow *=.*/net.ipv4.tcp_abort_on_overflow=1/" /etc/sysctl.conf'
-    fi
+    sshUpdate "$host" "echo ${SYSCTL_TCP_ABORT_ON_OVERFLOW} > /proc/sys/net/ipv4/tcp_abort_on_overflow"
+    ensure_conf_line "$host" /etc/sysctl.conf '^net.ipv4.tcp_abort_on_overflow[[:space:]]*=' "net.ipv4.tcp_abort_on_overflow=${SYSCTL_TCP_ABORT_ON_OVERFLOW}"
 }
 
-#设置max_map_count参数 1
+#设置max_map_count参数
 function change_mmc() {
     local host="$1"
     local info=$(get_node_sysinfo "$host")
@@ -775,319 +1055,158 @@ function change_mmc() {
     total_mem_gb=${total_mem_gb:-0}
     [[ "$total_mem_gb" =~ ^[0-9]+$ ]] || total_mem_gb=0
 
-    # Determine required max_map_count based on memory size
-    required_max_map_count=262144  # Default for 32GB
-    if [[ $total_mem_gb -ge 1000 ]]; then
-        required_max_map_count=8388608
-    elif [[ $total_mem_gb -ge 500 ]]; then
-        required_max_map_count=4194304
-    elif [[ $total_mem_gb -ge 240 ]]; then
-        required_max_map_count=2097152
-    elif [[ $total_mem_gb -ge 120 ]]; then
-        required_max_map_count=1048576
-    elif [[ $total_mem_gb -ge 60 ]]; then
-        required_max_map_count=524288
-    fi
+    local required_count
+    required_count=$(required_max_map_count "$total_mem_gb")
 
-    sshUpdate "$host" "echo $required_max_map_count > /proc/sys/vm/max_map_count"
-    # 配置文件/etc/sysctl.conf， 设置max_map_count参数
-    if [[ -z $(sshcheck "$host" 'grep "vm.max_map_count" /etc/sysctl.conf') ]]; then
-        sshUpdate "$host" "echo \"vm.max_map_count=$required_max_map_count\" >> /etc/sysctl.conf"
-    else
-        sshUpdate "$host" "sed -i \"s/^vm.max_map_count *=.*/vm.max_map_count = $required_max_map_count/\" /etc/sysctl.conf"
-    fi
+    sshUpdate "$host" "echo $required_count > /proc/sys/vm/max_map_count"
+    ensure_conf_line "$host" /etc/sysctl.conf '^vm.max_map_count[[:space:]]*=' "vm.max_map_count=${required_count}"
 }
 
 # 资源限制
 function change_limit() {
     local host="$1"
     # 临时修改该参数
-    sshUpdate "$host" 'ulimit -n 655350'
-    sshUpdate "$host" 'ulimit -u 65535'
+    sshUpdate "$host" "ulimit -n ${LIMIT_NOFILE}"
+    sshUpdate "$host" "ulimit -u ${LIMIT_NPROC}"
+
     # 在文件 /etc/security/limits.conf 添加配置
-    # 使用 sed 直接删除旧行再追加，避免 grep/sed 正则 ^* 的歧义以及空格/Tab混用匹配不上的问题
-    if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+soft[[:space:]]+nproc" /etc/security/limits.conf') ]]; then
-        sshUpdate "$host" 'echo "* soft nproc 65535" >> /etc/security/limits.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+soft[[:space:]]\+nproc\b.*/\* soft nproc 65535/" /etc/security/limits.conf'
-    fi
-
-    if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+hard[[:space:]]+nproc" /etc/security/limits.conf') ]]; then
-        sshUpdate "$host" 'echo "* hard nproc 65535" >> /etc/security/limits.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+hard[[:space:]]\+nproc\b.*/\* hard nproc 65535/" /etc/security/limits.conf'
-    fi
-
-    if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+soft[[:space:]]+nofile" /etc/security/limits.conf') ]]; then
-        sshUpdate "$host" 'echo "* soft nofile 655350" >> /etc/security/limits.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+soft[[:space:]]\+nofile\b.*/\* soft nofile 655350/" /etc/security/limits.conf'
-    fi
-
-    if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+hard[[:space:]]+nofile" /etc/security/limits.conf') ]]; then
-        sshUpdate "$host" 'echo "* hard nofile 655350" >> /etc/security/limits.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+hard[[:space:]]\+nofile\b.*/\* hard nofile 655350/" /etc/security/limits.conf'
-    fi
-
-    if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+soft[[:space:]]+stack" /etc/security/limits.conf') ]]; then
-        sshUpdate "$host" 'echo "* soft stack 8192" >> /etc/security/limits.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+soft[[:space:]]\+stack\b.*/\* soft stack 8192/" /etc/security/limits.conf'
-    fi
-
-    if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+hard[[:space:]]+stack" /etc/security/limits.conf') ]]; then
-        sshUpdate "$host" 'echo "* hard stack 8192" >> /etc/security/limits.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+hard[[:space:]]\+stack\b.*/\* hard stack 8192/" /etc/security/limits.conf'
-    fi
-
-    if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+soft[[:space:]]+memlock" /etc/security/limits.conf') ]]; then
-        sshUpdate "$host" 'echo "* soft memlock unlimited" >> /etc/security/limits.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+soft[[:space:]]\+memlock\b.*/\* soft memlock unlimited/" /etc/security/limits.conf'
-    fi
-
-    if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+hard[[:space:]]+memlock" /etc/security/limits.conf') ]]; then
-        sshUpdate "$host" 'echo "* hard memlock unlimited" >> /etc/security/limits.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+hard[[:space:]]\+memlock\b.*/\* hard memlock unlimited/" /etc/security/limits.conf'
-    fi
+    # ensure_conf_line 使用 sed 直接整行替换再追加，避免 grep/sed 正则 ^* 的歧义以及空格/Tab混用匹配不上的问题
+    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+soft[[:space:]]+nproc' "* soft nproc ${LIMIT_NPROC}"
+    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+hard[[:space:]]+nproc' "* hard nproc ${LIMIT_NPROC}"
+    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+soft[[:space:]]+nofile' "* soft nofile ${LIMIT_NOFILE}"
+    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+hard[[:space:]]+nofile' "* hard nofile ${LIMIT_NOFILE}"
+    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+soft[[:space:]]+stack' "* soft stack ${LIMIT_STACK}"
+    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+hard[[:space:]]+stack' "* hard stack ${LIMIT_STACK}"
+    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+soft[[:space:]]+memlock' "* soft memlock ${LIMIT_MEMLOCK}"
+    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+hard[[:space:]]+memlock' "* hard memlock ${LIMIT_MEMLOCK}"
 
     # 配置文件/etc/security/limits.d/20-nproc.conf， 设置soft nproc参数
-    if [[ -z $(sshcheck "$host" 'grep -P "^\*[[:space:]]+soft[[:space:]]+nproc" /etc/security/limits.d/20-nproc.conf') ]]; then
-        sshUpdate "$host" 'echo "* soft nproc 65535" >> /etc/security/limits.d/20-nproc.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^\*[[:space:]]\+soft[[:space:]]\+nproc\b.*/\* soft nproc 65535/" /etc/security/limits.d/20-nproc.conf'
-    fi
-
-    if [[ -z $(sshcheck "$host" 'grep -P "^root[[:space:]]+soft[[:space:]]+nproc" /etc/security/limits.d/20-nproc.conf') ]]; then
-        sshUpdate "$host" 'echo "root soft nproc 65535" >> /etc/security/limits.d/20-nproc.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^root[[:space:]]\+soft[[:space:]]\+nproc\b.*/root soft nproc 65535/" /etc/security/limits.d/20-nproc.conf'
-    fi
+    ensure_conf_line "$host" /etc/security/limits.d/20-nproc.conf '^\*[[:space:]]+soft[[:space:]]+nproc' "* soft nproc ${LIMIT_NPROC}"
+    ensure_conf_line "$host" /etc/security/limits.d/20-nproc.conf '^root[[:space:]]+soft[[:space:]]+nproc' "root soft nproc ${LIMIT_NPROC}"
 
     echo -e "ulimit -u:"$(sshcheck "$host" 'ulimit -u')
     echo -e "ulimit -n:"$(sshcheck "$host" 'ulimit -n')
 }
 
-# 检查指定节点信息
-function node_check() {
-    # 对节点进行检查
-    node_check_predata="$(echo_color yellow "节点IP"),$(echo_color yellow " 打开文件数"),$(echo_color yellow " SWAPPINESS 开关"),$(echo_color yellow " JDK 检查"),$(echo_color yellow " OVERCOMMIT_MEMORY"),$(echo_color yellow " CPU"),$(echo_color yellow " 最大进程数"),$(echo_color yellow " Huge Pages"),$(echo_color yellow " Somaxconn"),$(echo_color yellow " tcp_abort_on_overflow"),$(echo_color yellow " selinux check"),$(echo_color yellow " 节点内存"),$(echo_color yellow " 是否发生OOM"),$(echo_color yellow " 内存是否故障"),$(echo_color yellow " 磁盘属性"),$(echo_color yellow " VMA 数量"),$(echo_color yellow " 最大线程数"),$(echo_color yellow " 最大PID数"),$(echo_color yellow " clock check"),$(echo_color yellow " 磁盘空间")\n"
+# 通用节点检查函数，供 node_check/fe_check/be_check 共用，避免三份几乎相同的检查逻辑
+# 用法: run_node_checks <role> <host1> [host2 ...]
+#   role: node（手动指定节点）| fe | be
+#   - role=fe 时会多输出一列 FE JVM Xmx
+#   - role=be 时会跳过已在 FE 列表中检查过的节点，并使用 BE 的磁盘空间检查函数
+function run_node_checks() {
+    local role="$1"
+    shift
+    local hosts="$*"
 
-    for hostname in $*; do
-        {
-            $(ssh -o ConnectTimeout=3 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0 ${exe_user}@$hostname "pwd" &>/dev/null)
-            if [ $? != 0 ]; then
-                node_disconnect+=("$hostname")
-                continue
-            else
-                #echo $hostname
-                nodeConn=$(echo_color green $hostname)
-                # 检查 swappiness
-                nodeSwap=$(check_swap $hostname)
-                # 检查 文件打开数
-                nodeUlimitn=$(check_ulimitn $hostname)
-                # 检查 jdk
-                nodeJDK=$(jdk_check $hostname)
-                # 检查 overcommit_memory
-                nodeOvercommit=$(check_overcommit $hostname)
-                # 检查cpu
-                nodeCpu=$(cpu_check $hostname)
-                # 检查单用户最大进程数上限
-                nodeUlimitu=$(check_ulimitu $hostname)
-                # 检查 hugepage,默认关闭
-                nodeHuge=$(hugepage_check $hostname)
-                # 检查socket监听(listen)的backlog上限
-                nodeSomaxconn=$(check_somaxconn $hostname)
-                # 检查 tcp_abort_on_overflow
-                nodeCheck_tcp_overflow=$(check_tcp_overflow $hostname)
-                # 查看防火墙状态
-                nodeCheck_selinux=$(check_selinux $hostname)
-                # 查看节点内存
-                nodeCheck_sys_mem=$(check_sys_mem $hostname)
-                # 查看节点是否发生了 OOM
-                nodeCheck_oom_error=$(check_oom_error $hostname)
-                # 查看节点是否有内存故障
-                nodeCheck_mem_error=$(check_mem_error $hostname)
-                # 查看节点磁盘属性
-                nodeCheck_disk_prop=$(check_disk_prop $hostname)
-                # 时钟检查
-                nodeCheck_clock=$(check_clock $hostname)
-                # 检查进程可以拥有的VMA(虚拟内存区域)的数量
-                check_max_map_count=$(check_max_map_count $hostname)
+    local disk_space_func="check_fe_disk_space"
+    [[ "$role" == "be" ]] && disk_space_func="check_be_disk_space"
 
-                # 添加磁盘空间检查
-                disk_space_info=$(check_fe_disk_space $hostname)
-                
-                # 检查最大线程数
-                nodeCheck_threads_max=$(check_threads_max $hostname)
-                # 检查最大PID数
-                nodeCheck_pid_max=$(check_pid_max $hostname)
-                
-                detail="$nodeConn,$nodeUlimitn,$nodeSwap,$nodeJDK,$nodeOvercommit,$nodeCpu,$nodeUlimitu,$nodeHuge,$nodeSomaxconn,$nodeCheck_tcp_overflow,$nodeCheck_selinux,$nodeCheck_sys_mem,$nodeCheck_oom_error,$nodeCheck_mem_error,$nodeCheck_disk_prop,$check_max_map_count,$nodeCheck_threads_max,$nodeCheck_pid_max,$nodeCheck_clock,$disk_space_info"
-                node_check_predata="${node_check_predata}${detail}\n"
-            fi
-        }
+    local -a header_cols=(
+        "$(echo_color yellow "节点IP")"
+        "$(echo_color yellow " 打开文件数")"
+        "$(echo_color yellow " SWAPPINESS 开关")"
+        "$(echo_color yellow " JDK 检查")"
+    )
+    [[ "$role" == "fe" ]] && header_cols+=("$(echo_color yellow " FE JVM Xmx")")
+    header_cols+=(
+        "$(echo_color yellow " OVERCOMMIT_MEMORY")"
+        "$(echo_color yellow " CPU")"
+        "$(echo_color yellow " 最大进程数")"
+        "$(echo_color yellow " Huge Pages")"
+        "$(echo_color yellow " Somaxconn")"
+        "$(echo_color yellow " tcp_abort_on_overflow")"
+        "$(echo_color yellow " selinux check")"
+        "$(echo_color yellow " 节点内存")"
+        "$(echo_color yellow " 是否发生OOM")"
+        "$(echo_color yellow " 内存是否故障")"
+        "$(echo_color yellow " 磁盘属性")"
+        "$(echo_color yellow " VMA 数量")"
+        "$(echo_color yellow " 最大线程数")"
+        "$(echo_color yellow " 最大PID数")"
+        "$(echo_color yellow " clock check")"
+        "$(echo_color yellow " 磁盘空间")"
+    )
+    local header
+    header=$(IFS=,; echo "${header_cols[*]}")
+    local predata="${header}\n"
+
+    local -a disconnected=()
+    local -a already_checked=()
+
+    for hostname in $hosts; do
+        if ! ssh -o ConnectTimeout=3 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0 "${exe_user}@${hostname}" "pwd" &>/dev/null; then
+            disconnected+=("$hostname")
+            continue
+        fi
+
+        if [[ "$role" == "be" ]]; then
+            local skip=false
+            for checked_ip in ${feIps}; do
+                if [[ "$checked_ip" == "$hostname" ]]; then
+                    already_checked+=("$checked_ip")
+                    skip=true
+                    break
+                fi
+            done
+            [[ "$skip" == "true" ]] && continue
+        fi
+
+        local conn=$(echo_color green "$hostname")
+        local ulimitn=$(check_ulimitn "$hostname")
+        local swap=$(check_swap "$hostname")
+        local jdk=$(jdk_check "$hostname")
+        local xmx=""
+        [[ "$role" == "fe" ]] && xmx=$(check_Xmx "$hostname")
+        local overcommit=$(check_overcommit "$hostname")
+        local cpu=$(cpu_check "$hostname")
+        local ulimitu=$(check_ulimitu "$hostname")
+        local huge=$(hugepage_check "$hostname")
+        local somaxconn=$(check_somaxconn "$hostname")
+        local tcp_overflow=$(check_tcp_overflow "$hostname")
+        local selinux=$(check_selinux "$hostname")
+        local sys_mem=$(check_sys_mem "$hostname")
+        local oom_error=$(check_oom_error "$hostname")
+        local mem_error=$(check_mem_error "$hostname")
+        local disk_prop=$(check_disk_prop "$hostname")
+        local map_count=$(check_max_map_count "$hostname")
+        local disk_space=$("$disk_space_func" "$hostname")
+        local threads_max=$(check_threads_max "$hostname")
+        local pid_max=$(check_pid_max "$hostname")
+        local clock=$(check_clock "$hostname")
+
+        local detail="$conn,$ulimitn,$swap,$jdk"
+        [[ "$role" == "fe" ]] && detail="${detail},$xmx"
+        detail="${detail},$overcommit,$cpu,$ulimitu,$huge,$somaxconn,$tcp_overflow,$selinux,$sys_mem,$oom_error,$mem_error,$disk_prop,$map_count,$threads_max,$pid_max,$clock,$disk_space"
+
+        predata="${predata}${detail}\n"
     done
 
-    for dis_host in "${node_disconnect[@]}"; do
-        detail="$(echo_color red ${dis_host}" 节点免密未打通"),"
-        node_check_predata="${node_check_predata}${detail}\n"
+    if [[ "$role" == "be" ]]; then
+        for checked_host in "${already_checked[@]}"; do
+            predata="${predata}$(echo_color green "${checked_host} 节点已经检查过"),\n"
+        done
+    fi
+
+    for dis_host in "${disconnected[@]}"; do
+        predata="${predata}$(echo_color red "${dis_host} 节点免密未打通"),\n"
     done
 
-    echo_table $node_check_predata
+    echo_table "$predata"
 }
 
-# fe_check_predata=""
-# be_check_predata=""
-# fe_disconnect=()
-# be_disconnect=()
-# be_checked=()
+# 检查指定节点信息（手动指定的节点列表）
+function node_check() {
+    run_node_checks node "$@"
+}
+
 # fe节点进行检查
 function fe_check() {
-    fe_check_predata="$(echo_color yellow "节点IP"),$(echo_color yellow " 打开文件数"),$(echo_color yellow " SWAPPINESS 开关"),$(echo_color yellow " JDK 检查"),$(echo_color yellow " OVERCOMMIT_MEMORY"),$(echo_color yellow " CPU"),$(echo_color yellow " 最大进程数"),$(echo_color yellow " Huge Pages"),$(echo_color yellow " Somaxconn"),$(echo_color yellow " tcp_abort_on_overflow"),$(echo_color yellow " selinux check"),$(echo_color yellow " 节点内存"),$(echo_color yellow " 是否发生OOM"),$(echo_color yellow " 内存是否故障"),$(echo_color yellow " 磁盘属性"),$(echo_color yellow " VMA 数量"),$(echo_color yellow " 最大线程数"),$(echo_color yellow " 最大PID数"),$(echo_color yellow " clock check"),$(echo_color yellow " 磁盘空间")\n"
-    for hostname in ${feIps}; do
-        {
-            $(ssh -o ConnectTimeout=3 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0 ${exe_user}@$hostname "pwd" &>/dev/null)
-            if [ $? != 0 ]; then
-                fe_disconnect+=("$hostname")
-                continue
-            else
-                # echo $hostname
-                feconn=$(echo_color green $hostname)
-                # 检查 swappiness
-                feswap=$(check_swap $hostname)
-                # 检查 文件打开数
-                feUlimitn=$(check_ulimitn $hostname)
-                # 检查 jdk
-                feJDK=$(jdk_check $hostname)
-                # 检查 Xmx 大小
-                fe_check_Xmx=$(check_Xmx $hostname)
-                # 检查 overcommit_memory
-                feOvercommit=$(check_overcommit $hostname)
-                # 检查 cpu
-                feCpu=$(cpu_check $hostname)
-                # 检查单用户最大进程数上限
-                feUlimitu=$(check_ulimitu $hostname)
-                # 检查 hugepage,默认关闭
-                feHuge=$(hugepage_check $hostname)
-                # 检查socket监听(listen)的backlog上限
-                feSomaxconn=$(check_somaxconn $hostname)
-                # 检查 tcp_abort_on_overflow
-                feCheck_tcp_overflow=$(check_tcp_overflow $hostname)
-                # 查看防火墙状态
-                feCheck_selinux=$(check_selinux $hostname)
-                # 查看节点内存
-                feCheck_sys_mem=$(check_sys_mem $hostname)
-                # 查看节点是否发生了 OOM
-                feCheck_oom_error=$(check_oom_error $hostname)
-                # 查看节点是否有内存故障
-                feCheck_mem_error=$(check_mem_error $hostname)
-                # 查看节点磁盘属性
-                feCheck_disk_prop=$(check_disk_prop $hostname)
-                # 检查进程可以拥有的VMA(虚拟内存区域)的数量
-                check_max_map_count=$(check_max_map_count $hostname)
-
-                # 添加磁盘空间检查
-                disk_space_info=$(check_fe_disk_space $hostname)
-                
-                # 检查最大线程数
-                feCheck_threads_max=$(check_threads_max $hostname)
-                # 检查最大PID数
-                feCheck_pid_max=$(check_pid_max $hostname)
-                
-                detail="$feconn,$feUlimitn,$feswap,$feJDK,$fe_check_Xmx,$feOvercommit,$feCpu,$feUlimitu,$feHuge,$feSomaxconn,$feCheck_tcp_overflow,$feCheck_selinux,$feCheck_sys_mem,$feCheck_oom_error,$feCheck_mem_error,$feCheck_disk_prop,$check_max_map_count,$feCheck_threads_max,$feCheck_pid_max,$feCheck_clock,$disk_space_info"
-                fe_check_predata="${fe_check_predata}${detail}\n"
-            fi
-        } #&
-    done
-
-    for fehost in "${fe_disconnect[@]}"; do
-        detail="$(echo_color red ${fehost}" 节点免密未打通"),"
-        fe_check_predata="${fe_check_predata}${detail}\n"
-    done
-    echo_table $fe_check_predata
+    run_node_checks fe ${feIps}
 }
 
+# be节点进行检查，节点如果已经在FE中检查过，则跳过
 function be_check() {
-    # be节点进行检查
-    be_check_predata="$(echo_color yellow "节点IP"),$(echo_color yellow " 打开文件数"),$(echo_color yellow " SWAPPINESS 开关"),$(echo_color yellow " JDK 检查"),$(echo_color yellow " OVERCOMMIT_MEMORY"),$(echo_color yellow " CPU"),$(echo_color yellow " 最大进程数"),$(echo_color yellow " Huge Pages"),$(echo_color yellow " Somaxconn"),$(echo_color yellow " tcp_abort_on_overflow"),$(echo_color yellow " selinux check"),$(echo_color yellow " 节点内存"),$(echo_color yellow " 是否发生OOM"),$(echo_color yellow " 内存是否故障"),$(echo_color yellow " 磁盘属性"),$(echo_color yellow " VMA 数量"),$(echo_color yellow " 最大线程数"),$(echo_color yellow " 最大PID数"),$(echo_color yellow " clock check"),$(echo_color yellow " 磁盘空间")\n"
-
-    for hostname in ${beIps}; do
-        {
-            $(ssh -o ConnectTimeout=3 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0 ${exe_user}@$hostname "pwd" &>/dev/null)
-            if [ $? != 0 ]; then
-                be_disconnect+=("$hostname")
-                continue
-            else
-                for checked_ip in ${feIps}; do
-                    {
-                        if [[ $checked_ip == $hostname ]]; then
-                            be_checked+=("$checked_ip")
-                            continue 2
-                        fi
-                    }
-                done
-                #echo $hostname
-                beconn=$(echo_color green $hostname)
-                # 检查 swappiness
-                beswap=$(check_swap $hostname)
-                # 检查 文件打开数
-                beUlimitn=$(check_ulimitn $hostname)
-                # 检查 jdk
-                beJDK=$(jdk_check $hostname)
-                # 检查 overcommit_memory
-                beOvercommit=$(check_overcommit $hostname)
-                # 检查cpu
-                beCpu=$(cpu_check $hostname)
-                # 检查单用户最大进程数上限
-                beUlimitu=$(check_ulimitu $hostname)
-                # 检查 hugepage,默认关闭
-                beHuge=$(hugepage_check $hostname)
-                # 检查socket监听(listen)的backlog上限
-                beSomaxconn=$(check_somaxconn $hostname)
-                # 检查 tcp_abort_on_overflow
-                beCheck_tcp_overflow=$(check_tcp_overflow $hostname)
-                # 查看防火墙状态
-                beCheck_selinux=$(check_selinux $hostname)
-                # 查看节点内存
-                beCheck_sys_mem=$(check_sys_mem $hostname)
-                # 查看节点是否发生了 OOM
-                beCheck_oom_error=$(check_oom_error $hostname)
-                # 查看节点是否有内存故障
-                beCheck_mem_error=$(check_mem_error $hostname)
-                # 查看节点磁盘属性
-                beCheck_disk_prop=$(check_disk_prop $hostname)
-                # 检查进程可以拥有的VMA(虚拟内存区域)的数量
-                check_max_map_count=$(check_max_map_count $hostname)
-
-                # 添加磁盘空间检查
-                disk_space_info=$(check_be_disk_space $hostname)
-                
-                # 检查最大线程数
-                beCheck_threads_max=$(check_threads_max $hostname)
-                # 检查最大PID数
-                beCheck_pid_max=$(check_pid_max $hostname)
-                
-                detail="$beconn,$beUlimitn,$beswap,$beJDK,$beOvercommit,$beCpu,$beUlimitu,$beHuge,$beSomaxconn,$beCheck_tcp_overflow,$beCheck_selinux,$beCheck_sys_mem,$beCheck_oom_error,$beCheck_mem_error,$beCheck_disk_prop,$check_max_map_count,$beCheck_threads_max,$beCheck_pid_max,$beCheck_clock,$disk_space_info"
-                be_check_predata="${be_check_predata}${detail}\n"
-            fi
-        } #&
-    done
-
-    for be_checked_host in "${be_checked[@]}"; do
-        detail="$(echo_color green $be_checked_host" 节点已经检查过"),"
-        be_check_predata="${be_check_predata}${detail}\n"
-    done
-
-    for be_dis_host in "${be_disconnect[@]}"; do
-        detail="$(echo_color red ${be_dis_host}" 节点免密未打通"),"
-        be_check_predata="${be_check_predata}${detail}\n"
-    done
-
-    echo_table $be_check_predata
+    run_node_checks be ${beIps}
 }
 
 # fe 进程参数进行检查
@@ -1377,12 +1496,12 @@ function check_threads_max() {
     local threads_max=$(echo "$info" | grep "^THREADS_MAX=" | cut -d= -f2)
     local sysctl_conf=$(echo "$info" | grep "^SYSCTL_CONF=" | cut -d= -f2-)
 
-    if [[ $threads_max -ge 120000 ]] && echo "$sysctl_conf" | grep -qE "kernel.threads-max[[:space:]]*=[[:space:]]*[0-9]+"; then
+    if [[ $threads_max -ge $SYSCTL_THREADS_MAX ]] && echo "$sysctl_conf" | grep -qE "kernel.threads-max[[:space:]]*=[[:space:]]*[0-9]+"; then
         echo_color green "threads-max check pass ($threads_max)"
-    elif [[ $threads_max -ge 120000 ]]; then
+    elif [[ $threads_max -ge $SYSCTL_THREADS_MAX ]]; then
         echo_color red "check kernel.threads-max in /etc/sysctl.conf ($threads_max)"
     else
-        echo_color red "current: ${threads_max}, required: 120000"
+        echo_color red "current: ${threads_max}, required: ${SYSCTL_THREADS_MAX}"
     fi
 }
 
@@ -1393,35 +1512,27 @@ function check_pid_max() {
     local pid_max=$(echo "$info" | grep "^PID_MAX=" | cut -d= -f2)
     local sysctl_conf=$(echo "$info" | grep "^SYSCTL_CONF=" | cut -d= -f2-)
 
-    if [[ $pid_max -ge 200000 ]] && echo "$sysctl_conf" | grep -qE "kernel.pid_max[[:space:]]*=[[:space:]]*[0-9]+"; then
+    if [[ $pid_max -ge $SYSCTL_PID_MAX ]] && echo "$sysctl_conf" | grep -qE "kernel.pid_max[[:space:]]*=[[:space:]]*[0-9]+"; then
         echo_color green "pid-max check pass ($pid_max)"
-    elif [[ $pid_max -ge 200000 ]]; then
+    elif [[ $pid_max -ge $SYSCTL_PID_MAX ]]; then
         echo_color red "check kernel.pid_max in /etc/sysctl.conf ($pid_max)"
     else
-        echo_color red "current: ${pid_max}, required: 200000"
+        echo_color red "current: ${pid_max}, required: ${SYSCTL_PID_MAX}"
     fi
 }
 
 # 新增修改 kernel.threads-max 参数
 function change_threads_max() {
     local host="$1"
-    sshUpdate "$host" 'echo 120000 > /proc/sys/kernel/threads-max'
-    if [[ -z $(sshcheck "$host" 'grep "kernel.threads-max" /etc/sysctl.conf') ]]; then
-        sshUpdate "$host" 'echo "kernel.threads-max=120000" >> /etc/sysctl.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^kernel.threads-max *=.*/kernel.threads-max = 120000/" /etc/sysctl.conf'
-    fi
+    sshUpdate "$host" "echo ${SYSCTL_THREADS_MAX} > /proc/sys/kernel/threads-max"
+    ensure_conf_line "$host" /etc/sysctl.conf '^kernel.threads-max[[:space:]]*=' "kernel.threads-max=${SYSCTL_THREADS_MAX}"
 }
 
 # 新增修改 kernel.pid_max 参数
 function change_pid_max() {
     local host="$1"
-    sshUpdate "$host" 'echo 200000 > /proc/sys/kernel/pid_max'
-    if [[ -z $(sshcheck "$host" 'grep "kernel.pid_max" /etc/sysctl.conf') ]]; then
-        sshUpdate "$host" 'echo "kernel.pid_max=200000" >> /etc/sysctl.conf'
-    else
-        sshUpdate "$host" 'sed -i "s/^kernel.pid_max *=.*/kernel.pid_max = 200000/" /etc/sysctl.conf'
-    fi
+    sshUpdate "$host" "echo ${SYSCTL_PID_MAX} > /proc/sys/kernel/pid_max"
+    ensure_conf_line "$host" /etc/sysctl.conf '^kernel.pid_max[[:space:]]*=' "kernel.pid_max=${SYSCTL_PID_MAX}"
 }
 
 if [[ -n $node_list ]]; then
@@ -1472,251 +1583,6 @@ else
         checkVariables
     fi
 fi
-
-# ==============================================================================
-# 初始化部署环境功能
-# ==============================================================================
-
-# 使用sshpass进行密码登录
-function sshpass_ssh() {
-    local host="$1"
-    local user="$2"
-    local pass="$3"
-    local cmd="$4"
-    sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$user@$host" "$cmd" 2>/dev/null
-}
-
-function sshpass_scp() {
-    local pass="$1"
-    local src="$2"
-    local dest="$3"
-    sshpass -p "$pass" scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$src" "$dest" 2>/dev/null
-}
-
-# 在单个节点创建用户
-function create_user_on_node() {
-    local host="$1"
-    local user="$2"
-    local pass="$3"
-    local login_user="$4"
-    local login_pass="$5"
-
-    echo "  [${host}] 创建用户 ${user}..."
-
-    # 检查用户是否已存在
-    local user_exists=$(sshpass_ssh "$host" "$login_user" "$login_pass" "id $user 2>/dev/null" 2>&1)
-
-    if [[ "$user_exists" =~ "uid=" ]]; then
-        echo "    用户 $user 已存在，跳过创建"
-    else
-        # 创建用户
-        sshpass_ssh "$host" "$login_user" "$login_pass" "useradd -m -s /bin/bash $user" 2>&1
-        if [[ $? -ne 0 ]]; then
-            echo "    [错误] 创建用户失败"
-            return 1
-        fi
-        echo "    用户创建成功"
-    fi
-
-    # 设置密码
-    echo "$user:$pass" | sshpass_ssh "$host" "$login_user" "$login_pass" "chpasswd" 2>&1
-    if [[ $? -eq 0 ]]; then
-        echo "    密码设置成功"
-    else
-        echo "    [警告] 密码设置可能失败"
-    fi
-
-    # 配置sudo权限 (NOPASSWD)
-    sshpass_ssh "$host" "$login_user" "$login_pass" "echo '$user ALL=(ALL) NOPASSWD: ALL' > /tmp/${user}_sudoers" 2>&1
-    sshpass_ssh "$host" "$login_user" "$login_pass" "mv /tmp/${user}_sudoers /etc/sudoers.d/${user}" 2>&1
-    sshpass_ssh "$host" "$login_user" "$login_pass" "chmod 440 /etc/sudoers.d/${user}" 2>&1
-
-    echo "    Sudo权限配置完成"
-    return 0
-}
-
-# 在manager节点生成SSH密钥
-function setup_ssh_key() {
-    local manager="$1"
-    local user="$2"
-    local pass="$3"
-    local login_user="$4"
-    local login_pass="$5"
-
-    echo "  [${manager}] 生成SSH密钥..."
-
-    # 检查密钥是否已存在
-    local key_exists=$(sshpass_ssh "$manager" "$login_user" "$login_pass" "test -f /home/$user/.ssh/id_rsa && echo 'exists'" 2>&1)
-
-    if [[ "$key_exists" == "exists" ]]; then
-        echo "    SSH密钥已存在，跳过生成"
-    else
-        # 以目标用户身份生成密钥
-        # 先切换到目标用户
-        sshpass_ssh "$manager" "$login_user" "$login_pass" "su - $user -c 'ssh-keygen -t rsa -N \"\" -f /home/$user/.ssh/id_rsa'" 2>&1
-        if [[ $? -ne 0 ]]; then
-            echo "    [错误] SSH密钥生成失败"
-            return 1
-        fi
-        echo "    SSH密钥生成成功"
-    fi
-
-    # 设置authorized_keys权限
-    sshpass_ssh "$manager" "$login_user" "$login_pass" "mkdir -p /home/$user/.ssh && chmod 700 /home/$user/.ssh" 2>&1
-    sshpass_ssh "$manager" "$login_user" "$login_pass" "touch /home/$user/.ssh/authorized_keys && chmod 600 /home/$user/.ssh/authorized_keys" 2>&1
-    sshpass_ssh "$manager" "$login_user" "$login_pass" "chown -R $user:$user /home/$user/.ssh" 2>&1
-
-    # 获取公钥
-    local pub_key=$(sshpass_ssh "$manager" "$login_user" "$login_pass" "cat /home/$user/.ssh/id_rsa.pub" 2>&1)
-
-    echo "$pub_key"
-}
-
-# 分发SSH公钥到其他节点
-function distribute_ssh_key() {
-    local host="$1"
-    local pub_key="$2"
-    local user="$3"
-    local pass="$4"
-    local login_user="$5"
-    local login_pass="$6"
-
-    echo "  [${host}] 分发SSH公钥..."
-
-    # 确保.ssh目录存在
-    sshpass_ssh "$host" "$login_user" "$login_pass" "mkdir -p /home/$user/.ssh && chmod 700 /home/$user/.ssh" 2>&1
-
-    # 检查公钥是否已存在
-    local key_exists=$(sshpass_ssh "$host" "$login_user" "$login_pass" "grep -F '$pub_key' /home/$user/.ssh/authorized_keys" 2>&1)
-
-    if [[ -n "$key_exists" ]]; then
-        echo "    公钥已存在，跳过"
-    else
-        # 追加公钥到authorized_keys
-        sshpass_ssh "$host" "$login_user" "$login_pass" "echo '$pub_key' >> /home/$user/.ssh/authorized_keys" 2>&1
-        if [[ $? -eq 0 ]]; then
-            echo "    公钥分发成功"
-        else
-            echo "    [错误] 公钥分发失败"
-            return 1
-        fi
-    fi
-
-    # 设置正确权限
-    sshpass_ssh "$host" "$login_user" "$login_pass" "chmod 600 /home/$user/.ssh/authorized_keys && chown -R $user:$user /home/$user/.ssh" 2>&1
-
-    return 0
-}
-
-# 测试SSH免密登录
-function test_ssh_connection() {
-    local from_host="$1"
-    local to_host="$2"
-    local user="$3"
-    local pass="$4"
-    local login_user="$5"
-    local login_pass="$6"
-
-    echo "  测试 ${from_host} -> ${to_host} SSH免密..."
-
-    # 从源节点SSH到目标节点
-    local result=$(sshpass_ssh "$from_host" "$login_user" "$login_pass" "su - $user -c 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 $user@$to_host \"echo ok\"'" 2>&1)
-
-    if [[ "$result" == "ok" ]]; then
-        echo "    免密登录成功"
-        return 0
-    else
-        echo "    [错误] 免密登录失败: $result"
-        return 1
-    fi
-}
-
-# 主函数：初始化部署环境
-function init_deploy_env() {
-    echo ""
-    echo "=============================================================================================="
-    echo "                           开始初始化部署环境                                                "
-    echo "=============================================================================================="
-    echo ""
-    echo "配置信息："
-    echo "  节点列表: $deploy_nodes"
-    echo "  新用户: $new_user"
-    echo "  Manager节点: $manager_node"
-    echo "  登录用户: $sr_user"
-    echo ""
-
-    # 解析节点列表
-    local nodes=$(echo "$deploy_nodes" | tr ',;' ' ')
-    local node_array=()
-    for node in $nodes; do
-        node_array+=("$node")
-    done
-
-    # 检查节点数量
-    if [[ ${#node_array[@]} -lt 1 ]]; then
-        echo_color red "错误: 节点列表为空"
-        return 1
-    fi
-
-    echo_color yellow "步骤1: 在所有节点创建用户..."
-    for node in "${node_array[@]}"; do
-        create_user_on_node "$node" "$new_user" "$new_user_password" "$sr_user" "$sr_password"
-        if [[ $? -ne 0 ]]; then
-            echo_color red "在节点 $node 创建用户失败"
-            return 1
-        fi
-    done
-    echo_color green "  所有节点用户创建完成"
-    echo ""
-
-    echo_color yellow "步骤2: 在Manager节点生成SSH密钥..."
-    local pub_key=$(setup_ssh_key "$manager_node" "$new_user" "$new_user_password" "$sr_user" "$sr_password")
-    if [[ -z "$pub_key" ]]; then
-        echo_color red "  SSH密钥生成失败"
-        return 1
-    fi
-    echo_color green "  SSH密钥生成完成"
-    echo ""
-
-    echo_color yellow "步骤3: 分发SSH公钥到所有节点..."
-    for node in "${node_array[@]}"; do
-        distribute_ssh_key "$node" "$pub_key" "$new_user" "$new_user_password" "$sr_user" "$sr_password"
-        if [[ $? -ne 0 ]]; then
-            echo_color red "  公钥分发到 $node 失败"
-            return 1
-        fi
-    done
-    echo_color green "  所有节点公钥分发完成"
-    echo ""
-
-    echo_color yellow "步骤4: 测试SSH免密连接..."
-    local test_failed=0
-    for node in "${node_array[@]}"; do
-        if [[ "$node" != "$manager_node" ]]; then
-            test_ssh_connection "$manager_node" "$node" "$new_user" "$new_user_password" "$sr_user" "$sr_password"
-            if [[ $? -ne 0 ]]; then
-                test_failed=1
-            fi
-        fi
-    done
-
-    echo ""
-    echo "=============================================================================================="
-    if [[ $test_failed -eq 0 ]]; then
-        echo_color green "                           初始化部署环境完成!                                                  "
-    else
-        echo_color red "                           初始化完成，但部分免密测试失败                                            "
-    fi
-    echo "=============================================================================================="
-    echo ""
-    echo "后续步骤："
-    echo "  1. 使用 starrocks 用户登录各节点验证: ssh ${new_user}@<IP>"
-    echo "  2. 从 manager 节点免密登录其他节点: ssh ${new_user}@<其他节点IP>"
-    echo "  3. 继续部署 StarRocks 集群"
-    echo ""
-
-    return 0
-}
 
 exit 0
 
