@@ -22,6 +22,8 @@ new_user="starrocks"
 new_user_password=""
 # Manager节点IP
 manager_node=""
+# SSH 端口，默认22
+ssh_port=22
 
 # ---------------------------------------------------------------------------
 # 系统参数阈值配置（如需调整检查/修改的目标值，只改这里）
@@ -60,14 +62,14 @@ function sshpass_ssh() {
     local user="$2"
     local pass="$3"
     local cmd="$4"
-    sshpass -p "$pass" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$user@$host" "$cmd" 2>/dev/null
+    sshpass -p "$pass" ssh -p "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$user@$host" "$cmd" 2>/dev/null
 }
 
 function sshpass_scp() {
     local pass="$1"
     local src="$2"
     local dest="$3"
-    sshpass -p "$pass" scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$src" "$dest" 2>/dev/null
+    sshpass -p "$pass" scp -P "$ssh_port" -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$src" "$dest" 2>/dev/null
 }
 
 # 在单个节点创建用户
@@ -197,7 +199,7 @@ function test_ssh_connection() {
     echo "  测试 ${from_host} -> ${to_host} SSH免密..."
 
     # 从源节点SSH到目标节点
-    local result=$(sshpass_ssh "$from_host" "$login_user" "$login_pass" "su - $user -c 'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 $user@$to_host \"echo ok\"'" 2>&1)
+    local result=$(sshpass_ssh "$from_host" "$login_user" "$login_pass" "su - $user -c 'ssh -p $ssh_port -o StrictHostKeyChecking=no -o ConnectTimeout=5 $user@$to_host \"echo ok\"'" 2>&1)
 
     if [[ "$result" == "ok" ]]; then
         echo "    免密登录成功"
@@ -315,6 +317,8 @@ if [[ $1 = "--help" ]]; then
     echo "|                            |  修改指定节点配置示例，去掉-o参数可以查看节点配置：|          |"
     echo "|                            |  ./env_check.sh -l '10.0.0.1 10.0.0.2' -oupdate    |          |"
     echo "----------------------------------------------------------------------------------------------"
+    echo "|   -S 指定SSH端口           |  默认: 22                                          |  非必输  |"
+    echo "----------------------------------------------------------------------------------------------"
     echo "| 输出信息:                                                                                  |"
     echo "----------------------------------------------------------------------------------------------"
     echo "|   绿色:通过  红色:未通过  蓝色:需修改配置文件,否则重启失效  黄色：标题                     |"
@@ -333,6 +337,9 @@ if [[ $1 = "--help" ]]; then
     echo "  # 4. 检查并修改集群所有节点环境"
     echo "  ./env_check.sh -h 10.0.0.1 -u root -p 'password' -o update"
     echo ""
+    echo "  # 5. 节点SSH端口不是默认22时，通过 -S 指定"
+    echo "  ./env_check.sh -l '10.0.0.1 10.0.0.2' -S 2222"
+    echo ""
     echo "=============================================================================================="
     echo "                        初始化部署环境功能 (--init-deploy)                                      "
     echo "=============================================================================================="
@@ -347,6 +354,7 @@ if [[ $1 = "--help" ]]; then
     echo "|   --new-user                要创建的新用户名 (默认: starrocks)                             |"
     echo "|   --new-user-password       新用户的密码                                                  |"
     echo "|   --manager-node            Manager节点IP (将生成SSH密钥并分发给其他节点)                 |"
+    echo "|   --ssh-port                SSH端口 (默认: 22)                                          |"
     echo "----------------------------------------------------------------------------------------------"
     echo "| 示例：                                                                                    |"
     echo "|   ./env_check.sh --init-deploy \\                                                       |"
@@ -423,6 +431,10 @@ while [[ $# -gt 0 ]]; do
             manager_node="$2"
             shift 2
             ;;
+        --ssh-port)
+            ssh_port="$2"
+            shift 2
+            ;;
         -*)
             break
             ;;
@@ -456,7 +468,7 @@ if [[ "$init_deploy_mode" == "true" ]]; then
     exit $?
 fi
 
-while getopts ":h:P:u:p:o:l:" opt; do
+while getopts ":h:P:u:p:o:l:S:" opt; do
     case "$opt" in
     h)
         # 赋值ip
@@ -481,6 +493,10 @@ while getopts ":h:P:u:p:o:l:" opt; do
     l)
         # 节点列表
         node_list="${OPTARG}"
+        ;;
+    S)
+        # 赋值SSH端口，默认22
+        ssh_port="${OPTARG}"
         ;;
     ?)
         echo "未知参数"
@@ -562,7 +578,7 @@ if [[ ! -n $node_list ]]; then
 fi
 
 # SSH 连接参数
-SSH_OPTS="-o ConnectTimeout=10 -o StrictHostKeyChecking=no -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0"
+SSH_OPTS="-p ${ssh_port} -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0"
 
 # 到其他节点执行命令
 function sshcheck() {
@@ -1136,7 +1152,7 @@ function run_node_checks() {
     local -a already_checked=()
 
     for hostname in $hosts; do
-        if ! ssh -o ConnectTimeout=3 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0 "${exe_user}@${hostname}" "pwd" &>/dev/null; then
+        if ! ssh -p "${ssh_port}" -o ConnectTimeout=3 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0 "${exe_user}@${hostname}" "pwd" &>/dev/null; then
             disconnected+=("$hostname")
             continue
         fi
@@ -1216,7 +1232,7 @@ function fe_pid_check() {
     fe_check_predata="$(echo_color yellow "FE节点IP"),$(echo_color yellow " FE_PID ulimit -u"),$(echo_color yellow " FE_PID ulimit -n"),$(echo_color yellow " clock check")\n"
     for hostname in ${feIps}; do
         {
-            $(ssh -o ConnectTimeout=3 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0 ${exe_user}@$hostname "pwd" &>/dev/null)
+            $(ssh -p "${ssh_port}" -o ConnectTimeout=3 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0 ${exe_user}@$hostname "pwd" &>/dev/null)
             if [ $? != 0 ]; then
                 fe_disconnect+=("$hostname")
                 continue
@@ -1249,7 +1265,7 @@ function be_pid_check() {
 
     for hostname in ${beIps}; do
         {
-            $(ssh -o ConnectTimeout=3 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0 ${exe_user}@$hostname "pwd" &>/dev/null)
+            $(ssh -p "${ssh_port}" -o ConnectTimeout=3 -o PasswordAuthentication=no -o NumberOfPasswordPrompts=0 ${exe_user}@$hostname "pwd" &>/dev/null)
             if [ $? != 0 ]; then
                 be_disconnect+=("$hostname")
                 continue
