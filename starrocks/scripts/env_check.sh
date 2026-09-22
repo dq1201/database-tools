@@ -32,6 +32,7 @@ LIMIT_NOFILE=655350                # 单进程最大打开文件数 (ulimit -n /
 LIMIT_NPROC=65535                  # 单用户最大进程数 (ulimit -u / limits.conf nproc)
 LIMIT_STACK=8192                   # 线程栈大小，单位KB (limits.conf stack)
 LIMIT_MEMLOCK=unlimited            # 锁定内存大小 (limits.conf memlock)
+LIMIT_NPROC_20_CONF=unlimited      # limits.d/20-nproc.conf 里的 nproc 值，官方文档要求unlimited，与上面 limits.conf 的 LIMIT_NPROC 分开配置
 SYSCTL_SWAPPINESS=0                # vm.swappiness
 SYSCTL_OVERCOMMIT_MEMORY=1         # vm.overcommit_memory
 SYSCTL_SOMAXCONN=1024              # net.core.somaxconn
@@ -966,6 +967,32 @@ check_disk_prop() {
     echo_color green "sum_disk:$sum_disk hdd_num:$hdd_num ssd_num:$ssd_num"
 }
 
+# 检查磁盘I/O调度算法：HDD建议mq-deadline，SSD建议kyber(内核不支持kyber则退化为none)
+function check_disk_scheduler() {
+    local host="$1"
+    local result
+    result=$(sshcheck "$host" '
+        lsblk -d -o name,rota -n 2>/dev/null | while read -r disk rota; do
+            sched_file="/sys/block/$disk/queue/scheduler"
+            [ -f "$sched_file" ] || continue
+            current=$(sed -n "s/.*\[\(.*\)\].*/\1/p" "$sched_file")
+            if [ "$rota" = "1" ]; then
+                expected="mq-deadline"
+            elif grep -qw kyber "$sched_file"; then
+                expected="kyber"
+            else
+                expected="none"
+            fi
+            [ "$current" != "$expected" ] && echo "$disk:current=$current,expected=$expected;"
+        done
+    ')
+    if [ -z "$result" ]; then
+        echo_color green "scheduler check pass"
+    else
+        echo_color red "$result"
+    fi
+}
+
 # 检查进程可以拥有的VMA(虚拟内存区域)的数量
 function check_max_map_count() {
     local host="$1"
@@ -1035,6 +1062,30 @@ function change_huge() {
     echo -e "hugepage:"$(sshcheck "$host" 'cat /sys/kernel/mm/transparent_hugepage/defrag')
 }
 
+# 设置磁盘I/O调度算法：HDD→mq-deadline，SSD→kyber(内核不支持则用none)
+# 临时生效 + 写入 rc.local 永久生效（写入前先判断是否已存在，避免每次 -o update 都重复追加同一行）
+function change_disk_scheduler() {
+    local host="$1"
+    sshUpdate "$host" 'chmod +x /etc/rc.d/rc.local'
+    sshUpdate "$host" '
+        lsblk -d -o name,rota -n 2>/dev/null | while read -r disk rota; do
+            sched_file="/sys/block/$disk/queue/scheduler"
+            [ -f "$sched_file" ] || continue
+            if [ "$rota" = "1" ]; then
+                target="mq-deadline"
+            elif grep -qw kyber "$sched_file"; then
+                target="kyber"
+            else
+                target="none"
+            fi
+            echo "$target" > "$sched_file" 2>/dev/null
+            line="echo $target > $sched_file"
+            grep -qxF "$line" /etc/rc.local 2>/dev/null || echo "$line" >> /etc/rc.local
+        done
+    '
+    echo -e "disk scheduler:"$(sshcheck "$host" 'lsblk -d -o name,rota -n 2>/dev/null | while read -r disk rota; do f=/sys/block/$disk/queue/scheduler; [ -f "$f" ] && echo -n "$disk=$(sed -n "s/.*\[\(.*\)\].*/\1/p" "$f") "; done')
+}
+
 #swappiness 0
 function change_swap() {
     local host="$1"
@@ -1099,8 +1150,8 @@ function change_limit() {
     ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+hard[[:space:]]+memlock' "* hard memlock ${LIMIT_MEMLOCK}"
 
     # 配置文件/etc/security/limits.d/20-nproc.conf， 设置soft nproc参数
-    ensure_conf_line "$host" /etc/security/limits.d/20-nproc.conf '^\*[[:space:]]+soft[[:space:]]+nproc' "* soft nproc ${LIMIT_NPROC}"
-    ensure_conf_line "$host" /etc/security/limits.d/20-nproc.conf '^root[[:space:]]+soft[[:space:]]+nproc' "root soft nproc ${LIMIT_NPROC}"
+    ensure_conf_line "$host" /etc/security/limits.d/20-nproc.conf '^\*[[:space:]]+soft[[:space:]]+nproc' "* soft nproc ${LIMIT_NPROC_20_CONF}"
+    ensure_conf_line "$host" /etc/security/limits.d/20-nproc.conf '^root[[:space:]]+soft[[:space:]]+nproc' "root soft nproc ${LIMIT_NPROC_20_CONF}"
 
     echo -e "ulimit -u:"$(sshcheck "$host" 'ulimit -u')
     echo -e "ulimit -n:"$(sshcheck "$host" 'ulimit -n')
@@ -1138,6 +1189,7 @@ function run_node_checks() {
         "$(echo_color yellow " 是否发生OOM")"
         "$(echo_color yellow " 内存是否故障")"
         "$(echo_color yellow " 磁盘属性")"
+        "$(echo_color yellow " 磁盘调度算法")"
         "$(echo_color yellow " VMA 数量")"
         "$(echo_color yellow " 最大线程数")"
         "$(echo_color yellow " 最大PID数")"
@@ -1186,6 +1238,7 @@ function run_node_checks() {
         local oom_error=$(check_oom_error "$hostname")
         local mem_error=$(check_mem_error "$hostname")
         local disk_prop=$(check_disk_prop "$hostname")
+        local disk_scheduler=$(check_disk_scheduler "$hostname")
         local map_count=$(check_max_map_count "$hostname")
         local disk_space=$("$disk_space_func" "$hostname")
         local threads_max=$(check_threads_max "$hostname")
@@ -1194,7 +1247,7 @@ function run_node_checks() {
 
         local detail="$conn,$ulimitn,$swap,$jdk"
         [[ "$role" == "fe" ]] && detail="${detail},$xmx"
-        detail="${detail},$overcommit,$cpu,$ulimitu,$huge,$somaxconn,$tcp_overflow,$selinux,$sys_mem,$oom_error,$mem_error,$disk_prop,$map_count,$threads_max,$pid_max,$clock,$disk_space"
+        detail="${detail},$overcommit,$cpu,$ulimitu,$huge,$somaxconn,$tcp_overflow,$selinux,$sys_mem,$oom_error,$mem_error,$disk_prop,$disk_scheduler,$map_count,$threads_max,$pid_max,$clock,$disk_space"
 
         predata="${predata}${detail}\n"
     done
@@ -1297,6 +1350,7 @@ function be_pid_check() {
 function change_opt() {
     change_selinux $1
     change_huge $1
+    change_disk_scheduler $1
     change_swap $1
     change_limit $1
     change_overcommit $1
