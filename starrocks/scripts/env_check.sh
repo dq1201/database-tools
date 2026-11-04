@@ -1042,7 +1042,11 @@ function checkVariables() {
 # SELINUX setenforce 0
 change_selinux() {
     local host="$1"
-    sshUpdate "$host" 'setenforce 0'
+    # setenforce 只在SELinux处于enforcing/permissive时才能切换；如果内核层面已经是Disabled，
+    # 执行setenforce会报错退出（"setenforce: SELinux is disabled"），属于良性误报，这里先判断状态避免误报告警
+    if [[ "$(sshcheck "$host" 'getenforce')" != "Disabled" ]]; then
+        sshUpdate "$host" 'setenforce 0'
+    fi
     ensure_conf_line "$host" /etc/selinux/config '^SELINUX[[:space:]]*=' "SELINUX=disabled"
     if [[ -n $(sshcheck "$host" 'grep "^SELINUXTYPE" /etc/selinux/config') ]]; then
         sshUpdate "$host" 'sed -i "s/^SELINUXTYPE *=.*/#SELINUXTYPE/" /etc/selinux/config'
@@ -1140,14 +1144,23 @@ function change_limit() {
 
     # 在文件 /etc/security/limits.conf 添加配置
     # ensure_conf_line 使用 sed 直接整行替换再追加，避免 grep/sed 正则 ^* 的歧义以及空格/Tab混用匹配不上的问题
-    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+soft[[:space:]]+nproc' "* soft nproc ${LIMIT_NPROC}"
-    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+hard[[:space:]]+nproc' "* hard nproc ${LIMIT_NPROC}"
-    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+soft[[:space:]]+nofile' "* soft nofile ${LIMIT_NOFILE}"
-    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+hard[[:space:]]+nofile' "* hard nofile ${LIMIT_NOFILE}"
-    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+soft[[:space:]]+stack' "* soft stack ${LIMIT_STACK}"
-    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+hard[[:space:]]+stack' "* hard stack ${LIMIT_STACK}"
-    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+soft[[:space:]]+memlock' "* soft memlock ${LIMIT_MEMLOCK}"
-    ensure_conf_line "$host" /etc/security/limits.conf '^\*[[:space:]]+hard[[:space:]]+memlock' "* hard memlock ${LIMIT_MEMLOCK}"
+    #
+    # PAM 解析 limits.conf 时，精确用户名的条目优先级高于通配符 "*"：不少云厂商镜像会预置
+    # "root soft/hard nofile 65535" 这类专属 root 的行，如果只改 "*" 通配行，SSH 以 root 登录时
+    # 实际生效的仍是镜像自带的那个值，通配符设置形同虚设。这里除了 "*" 之外，再显式覆盖一遍
+    # 当前 SSH 登录用户(${exe_user})专属的条目，防止镜像预置行把通配符设置架空。
+    for domain in '\*' "${exe_user}"; do
+        local literal_domain="${domain}"
+        [[ "$domain" == '\*' ]] && literal_domain='*'
+        ensure_conf_line "$host" /etc/security/limits.conf "^${domain}[[:space:]]+soft[[:space:]]+nproc" "${literal_domain} soft nproc ${LIMIT_NPROC}"
+        ensure_conf_line "$host" /etc/security/limits.conf "^${domain}[[:space:]]+hard[[:space:]]+nproc" "${literal_domain} hard nproc ${LIMIT_NPROC}"
+        ensure_conf_line "$host" /etc/security/limits.conf "^${domain}[[:space:]]+soft[[:space:]]+nofile" "${literal_domain} soft nofile ${LIMIT_NOFILE}"
+        ensure_conf_line "$host" /etc/security/limits.conf "^${domain}[[:space:]]+hard[[:space:]]+nofile" "${literal_domain} hard nofile ${LIMIT_NOFILE}"
+        ensure_conf_line "$host" /etc/security/limits.conf "^${domain}[[:space:]]+soft[[:space:]]+stack" "${literal_domain} soft stack ${LIMIT_STACK}"
+        ensure_conf_line "$host" /etc/security/limits.conf "^${domain}[[:space:]]+hard[[:space:]]+stack" "${literal_domain} hard stack ${LIMIT_STACK}"
+        ensure_conf_line "$host" /etc/security/limits.conf "^${domain}[[:space:]]+soft[[:space:]]+memlock" "${literal_domain} soft memlock ${LIMIT_MEMLOCK}"
+        ensure_conf_line "$host" /etc/security/limits.conf "^${domain}[[:space:]]+hard[[:space:]]+memlock" "${literal_domain} hard memlock ${LIMIT_MEMLOCK}"
+    done
 
     # 配置文件/etc/security/limits.d/20-nproc.conf， 设置soft nproc参数
     ensure_conf_line "$host" /etc/security/limits.d/20-nproc.conf '^\*[[:space:]]+soft[[:space:]]+nproc' "* soft nproc ${LIMIT_NPROC_20_CONF}"
